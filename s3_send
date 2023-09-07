@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+
+say() {
+    echo -e "$1"
+}
+
+warn() {
+    say "\x1b[1;33mWARN\x1b[0m: $1"
+}
+
+error() {
+    say "\x1b[1;31mERROR\x1b[0m: $1"
+}
+
+show_usage() {
+    say "Send stdin to S3 by splitting it into chunks and uploading them FIFO in the background"
+    say
+    say "To raw send a zfs snapshot in chunks of 512M blobs called 'tank.0000', 'tank.0001', etc:"
+    say "    zfs send -w tank@snap | s3_send --block-size=512M --prefix=tank s3://my_bucket"
+    say
+    say "Usage: s3_send [OPTIONS] S3_URI"
+    say
+    say "Arguments:"
+    say "    S3_URI             destination S3 URI (same as 'aws s3 cp ... S3_URI')"
+    say
+    say "Options:"
+    say "    --prefix           name prefix of chunk files, same as 'split - PREFIX' (default: upload_chunk)"
+    say "    --storage-class    S3 storage class, same as 'aws s3 cp' (default: DEEP_ARCHIVE)"
+    say "    --block-size       size of a chunk file, same as 'split -b' (default: 512M)"
+    exit 1
+}
+
+arguments=()
+
+for arg in ${@:1}; do
+    case $arg in
+        --prefix=*)
+            prefix="${arg#*=}"
+            ;;
+        --storage-class=*)
+            storage_class="${arg#*=}"
+            ;;
+        --block-size=*)
+            block_size="${arg#*=}"
+            ;;
+        --*)
+            error "unknown argument: $arg"
+            exit 1
+            ;;
+        *)
+            arguments+=($arg)
+            ;;
+    esac
+done
+
+storage_class=${storage_class:-DEEP_ARCHIVE}
+
+send_to_glacier() {
+    aws s3 --storage-class="$storage_class" cp $1 $2
+}
+
+destination_s3_uri="${arguments[0]}"
+
+if [[ -z "$destination_s3_uri" ]]; then
+    show_usage
+    exit 1
+fi
+
+prefix="${prefix:-upload_chunk}."
+
+block_size="${block_size:-512M}"
+
+say "prefix=$prefix storage_class=${storage_class} block_size=${block_size} destination=$destination_s3_uri"
+
+list_files_with_prefix() {
+    ls -l --format=single-column | grep "$prefix"
+}
+
+existing_files=($(list_files_with_prefix))
+n_existing_files=${#existing_files[@]}
+
+if [ $n_existing_files -ne 0 ]; then
+    error "there are $n_existing_files matching the prefix '$prefix', remove them first"
+    exit 1
+fi
+
+say "starting split"
+split -d -a4 "-b${block_size}" - "$prefix" < <(cat) &
+
+pid=$!
+
+cleanup() {
+    if ps $pid; then
+        warn "stopping split"
+        kill $pid
+    fi
+}
+
+trap cleanup EXIT
+
+while ps $pid 2>&1 > /dev/null; do
+    files=($(list_files_with_prefix))
+
+    num_files=${#files[@]}
+
+    if [[ $num_files -ge 2 ]]; then
+        let minus_last_file=$num_files-1
+
+        say "uploading $minus_last_file files"
+
+        for f in ${files[@]:0:$minus_last_file}; do
+            if send_to_glacier $f $destination_s3_uri/$f; then
+                rm $f
+            else
+                warn "did not send $f"
+            fi
+        done
+    fi
+
+    sleep 1
+done
+
+remaining_files=($(list_files_with_prefix))
+
+say "split done, now uploading remaining ${#remaining_files[@]} files"
+
+for f in ${remaining_files[@]}; do
+    if send_to_glacier $f $destination_s3_uri/$f; then
+        rm $f
+    else
+        warn "did not send $f"
+    fi
+done
